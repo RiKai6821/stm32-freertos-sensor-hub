@@ -18,7 +18,8 @@
 
 /* 帧类型 */
 typedef enum {
-    FRAME_TYPE_SENSOR_DATA = 0x01,  /* 设备 → 上位机：传感器数据 */
+    FRAME_TYPE_SENSOR_DATA = 0x01,  /* 设备 → 上位机：传感器原始数据 */
+    FRAME_TYPE_AHRS_DATA   = 0x02,  /* 设备 → 上位机：互补滤波姿态角 */
     FRAME_TYPE_CMD_SET_RATE = 0x10, /* 上位机 → 设备：设置采样率 */
     FRAME_TYPE_CMD_RESET    = 0x11, /* 上位机 → 设备：复位 */
     FRAME_TYPE_ACK          = 0x80, /* 设备 → 上位机：确认 */
@@ -31,11 +32,19 @@ typedef struct __attribute__((packed)) {
     int16_t  accel_x;       /* X 轴加速度 LSB（÷16384 = g） */
     int16_t  accel_y;
     int16_t  accel_z;
-    int16_t  gyro_x;        /* X 轴角速度 LSB（÷131 = deg/s） */
+    int16_t  gyro_x;        /* X 轴角速度 LSB（÷65.5 = deg/s，量程±500） */
     int16_t  gyro_y;
     int16_t  gyro_z;
     int16_t  temperature;   /* 温度 LSB（÷340 + 36.53 = ℃） */
 } SensorPayload_t;          /* 18 bytes */
+
+/* AHRS 姿态角载荷 */
+typedef struct __attribute__((packed)) {
+    uint32_t timestamp;  /* 毫秒时间戳 */
+    int16_t  roll;       /* 滚转角 × 100，单位 0.01° */
+    int16_t  pitch;      /* 俯仰角 × 100 */
+    int16_t  yaw;        /* 偏航角 × 100（纯陀螺积分，有漂移） */
+} AhrsPayload_t;         /* 10 bytes */
 
 /* 设置采样率命令载荷 */
 typedef struct __attribute__((packed)) {

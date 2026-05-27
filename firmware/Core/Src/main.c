@@ -17,6 +17,7 @@
 #include "cmsis_os.h"
 #include "mpu6050.h"
 #include "protocol.h"
+#include "ahrs.h"
 #include <string.h>
 
 /* ===== HAL 句柄 ===== */
@@ -34,6 +35,7 @@ osMessageQueueId_t displayQueueHandle;  /* MPU6050 数据 → 显示任务 */
 osMessageQueueId_t cmdQueueHandle;      /* UART 收到的命令字节 */
 
 osMutexId_t configMutexHandle;
+osMutexId_t uartTxMutexHandle;          /* 保护 UART TX（CommTask + CmdTask 共用） */
 
 /* ===== 全局配置（互斥量保护） ===== */
 static uint16_t g_sample_rate_hz = 100;  /* 默认 100Hz */
@@ -81,7 +83,8 @@ int main(void)
     cmdQueueHandle     = osMessageQueueNew(32, sizeof(uint8_t), NULL);
     
     /* 创建互斥量 */
-    configMutexHandle = osMutexNew(NULL);
+    configMutexHandle  = osMutexNew(NULL);
+    uartTxMutexHandle  = osMutexNew(NULL);
     
     /* 创建任务（优先级：sensor > comm = cmd > display） */
     const osThreadAttr_t sensor_attr  = { .name = "Sensor",  .stack_size = 256 * 4, .priority = osPriorityHigh };
@@ -130,34 +133,69 @@ static void SensorTask(void *argument)
 }
 
 /* =========================================================
- * 任务 2: 数据上报
+ * 任务 2: 数据上报 + AHRS 姿态解算
  * ========================================================= */
 static void CommTask(void *argument)
 {
-    MPU6050_Data_t data;
+    MPU6050_Data_t  data;
     SensorPayload_t payload;
-    uint8_t frame_buf[64];
-    
+    AhrsPayload_t   ahrs_payload;
+    AhrsAngle_t     ahrs;
+    uint8_t  frame_buf[64];
+    uint32_t last_tick = 0;
+    uint8_t  ahrs_initialized = 0;
+
     while (1) {
         /* 阻塞等待传感器数据 */
-        if (osMessageQueueGet(sensorQueueHandle, &data, NULL, osWaitForever) == osOK) {
-            /* 组装载荷 */
-            payload.timestamp   = osKernelGetTickCount();
-            payload.accel_x     = data.accel_x;
-            payload.accel_y     = data.accel_y;
-            payload.accel_z     = data.accel_z;
-            payload.gyro_x      = data.gyro_x;
-            payload.gyro_y      = data.gyro_y;
-            payload.gyro_z      = data.gyro_z;
-            payload.temperature = data.temperature;
-            
-            /* 打包成帧 */
-            uint16_t len = Protocol_Pack(frame_buf, FRAME_TYPE_SENSOR_DATA,
-                                         &payload, sizeof(payload));
-            
-            /* 发送（带超时，防止 UART 出错时任务挂死） */
-            HAL_UART_Transmit(&huart1, frame_buf, len, 50);
+        if (osMessageQueueGet(sensorQueueHandle, &data, NULL, osWaitForever) != osOK) {
+            continue;
         }
+
+        uint32_t now = osKernelGetTickCount();
+
+        /* ---- AHRS 互补滤波更新 ---- */
+        if (!ahrs_initialized) {
+            AHRS_Init(&ahrs, data.accel_x, data.accel_y, data.accel_z);
+            ahrs_initialized = 1;
+        } else {
+            uint32_t dt_ms = now - last_tick;
+            /* dt 超出合理范围时跳过（初始帧或调试暂停） */
+            if (dt_ms > 0 && dt_ms < 500) {
+                AHRS_Update(&ahrs,
+                            data.accel_x, data.accel_y, data.accel_z,
+                            data.gyro_x,  data.gyro_y,  data.gyro_z,
+                            dt_ms);
+            }
+        }
+        last_tick = now;
+
+        /* ---- 帧 1：原始传感器数据 ---- */
+        payload.timestamp   = now;
+        payload.accel_x     = data.accel_x;
+        payload.accel_y     = data.accel_y;
+        payload.accel_z     = data.accel_z;
+        payload.gyro_x      = data.gyro_x;
+        payload.gyro_y      = data.gyro_y;
+        payload.gyro_z      = data.gyro_z;
+        payload.temperature = data.temperature;
+
+        uint16_t len = Protocol_Pack(frame_buf, FRAME_TYPE_SENSOR_DATA,
+                                     &payload, sizeof(payload));
+        osMutexAcquire(uartTxMutexHandle, osWaitForever);
+        HAL_UART_Transmit(&huart1, frame_buf, len, 50);
+        osMutexRelease(uartTxMutexHandle);
+
+        /* ---- 帧 2：AHRS 姿态角（互补滤波输出，0.01° 精度） ---- */
+        ahrs_payload.timestamp = now;
+        ahrs_payload.roll      = (int16_t)(ahrs.roll  * 100.0f);
+        ahrs_payload.pitch     = (int16_t)(ahrs.pitch * 100.0f);
+        ahrs_payload.yaw       = (int16_t)(ahrs.yaw   * 100.0f);
+
+        len = Protocol_Pack(frame_buf, FRAME_TYPE_AHRS_DATA,
+                            &ahrs_payload, sizeof(ahrs_payload));
+        osMutexAcquire(uartTxMutexHandle, osWaitForever);
+        HAL_UART_Transmit(&huart1, frame_buf, len, 50);
+        osMutexRelease(uartTxMutexHandle);
     }
 }
 
@@ -224,13 +262,33 @@ static void CmdTask(void *argument)
                     if (calc == byte) {
                         /* 校验通过，处理命令 */
                         uint8_t type = buf[0];
+                        uint8_t resp_buf[8];
+                        uint16_t resp_len = 0;
+
                         if (type == FRAME_TYPE_CMD_SET_RATE && len == 4) {
                             uint16_t rate = buf[1] | (buf[2] << 8);
                             if (rate == 20 || rate == 100 || rate == 500) {
                                 osMutexAcquire(configMutexHandle, osWaitForever);
                                 g_sample_rate_hz = rate;
                                 osMutexRelease(configMutexHandle);
+                                /* ACK：无载荷 */
+                                resp_len = Protocol_Pack(resp_buf, FRAME_TYPE_ACK, NULL, 0);
+                            } else {
+                                /* NACK：error_code=0x01（非法参数） */
+                                uint8_t ec = 0x01;
+                                resp_len = Protocol_Pack(resp_buf, FRAME_TYPE_NACK, &ec, 1);
                             }
+                        } else if (type == FRAME_TYPE_CMD_RESET) {
+                            resp_len = Protocol_Pack(resp_buf, FRAME_TYPE_ACK, NULL, 0);
+                        } else {
+                            uint8_t ec = 0x02;  /* 未知命令 */
+                            resp_len = Protocol_Pack(resp_buf, FRAME_TYPE_NACK, &ec, 1);
+                        }
+
+                        if (resp_len > 0) {
+                            osMutexAcquire(uartTxMutexHandle, osWaitForever);
+                            HAL_UART_Transmit(&huart1, resp_buf, resp_len, 50);
+                            osMutexRelease(uartTxMutexHandle);
                         }
                     }
                     state = S_WAIT_H1;

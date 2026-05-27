@@ -132,12 +132,98 @@
   - FreeRTOS：CMSIS_V2 接口
   - Tick 频率：1000Hz
 
-### 上位机端
+### 上位机端（Python）
+
+#### 环境安装（一次性）
+
 ```bash
+# 确认 Python 版本 >= 3.8
+python3 --version
+
+# 进入上位机目录
 cd upper_computer
+
+# 安装依赖
 pip install -r requirements.txt
+```
+
+> **Windows 用户**：如果 `pip` 报错，改用 `python -m pip install -r requirements.txt`
+
+#### 有真实硬件时
+
+1. 将 USB-TTL 模块插入电脑，确认驱动已安装
+2. 查找串口名：
+   - macOS：`ls /dev/cu.*`，找到类似 `/dev/cu.usbserial-XXXX`
+   - Linux：`ls /dev/ttyUSB*`
+   - Windows：设备管理器 → 端口，找到 COMx
+3. 运行上位机：`python main.py`
+4. 在 GUI 左上角下拉框选择对应串口，点击 **"连接"**
+5. 点击 **"开始录制"** 即可保存 CSV 数据
+
+#### 无硬件时：用模拟器测试
+
+`simulator.py` 可生成与真实固件格式完全一致的仿真数据，让你在没有硬件时也能看到效果。
+
+**第一步：安装 socat（创建虚拟串口对）**
+
+```bash
+# macOS
+brew install socat
+
+# Ubuntu/Debian
+sudo apt install socat
+```
+
+**第二步：创建虚拟串口对**
+
+打开一个新终端窗口，运行：
+
+```bash
+socat -d -d pty,raw,echo=0 pty,raw,echo=0
+```
+
+会输出类似：
+
+```
+2024/01/01 12:00:00 socat[12345] N PTY is /dev/ttys003
+2024/01/01 12:00:00 socat[12345] N PTY is /dev/ttys004
+```
+
+记住这两个端口名（如 `/dev/ttys003` 和 `/dev/ttys004`）。
+
+**第三步：启动模拟器**
+
+打开另一个终端，编辑 `simulator.py` 第 57 行，将 `SIM_PORT` 改为 **第一个** 端口（如 `/dev/ttys003`），然后运行：
+
+```bash
+python simulator.py
+```
+
+**第四步：运行上位机**
+
+再开一个终端运行：
+
+```bash
 python main.py
 ```
+
+在 GUI 中选择 **第二个** 端口（如 `/dev/ttys004`），点击 **"连接"**，即可看到实时曲线。
+
+#### 上位机功能说明
+
+| 功能 | 操作 |
+|------|------|
+| 连接串口 | 下拉选择串口 → 点击"连接" |
+| 断开 | 再次点击"连接"（变为"断开"） |
+| 刷新串口列表 | 点击"刷新" |
+| 切换采样率 | 右上角下拉（20Hz / 100Hz / 500Hz），实时发送命令给 STM32 |
+| 录制数据 | 点击"开始录制" → "停止录制" |
+| 保存 CSV | 点击"保存 CSV"，选择路径 |
+
+**三个绘图区说明：**
+- 上：加速度 XYZ（单位 g）
+- 中：角速度 XYZ（单位 deg/s）
+- 下：AHRS 互补滤波姿态角 Roll / Pitch
 
 ## 项目结构
 
@@ -155,6 +241,7 @@ stm32-freertos-sensor-hub/
 │           └── main.c              # FreeRTOS 任务定义
 ├── upper_computer/
 │   ├── main.py                     # PyQt5 上位机
+│   ├── simulator.py                # 仿真数据生成器（无硬件时测试用）
 │   └── requirements.txt
 ├── docs/
 │   └── architecture.md

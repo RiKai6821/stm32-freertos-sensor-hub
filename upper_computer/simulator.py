@@ -68,22 +68,84 @@ def pack_frame(frame_type: int, payload: bytes) -> bytes:
     return bytes([FRAME_HEADER_1, FRAME_HEADER_2, length]) + body + bytes([crc])
 
 
+def sim_attitude(t: float):
+    """
+    物理一致的姿态仿真：Roll/Pitch 做大幅摆动，加速度由旋转矩阵推导。
+
+    运动剧本（每 40 秒一个周期）：
+      0–10s : 平放静止 → Roll 缓慢倾斜到 +45°（向右倒）
+      10–20s: Roll 回到 0° → Pitch 倾斜到 -30°（向前俯）
+      20–30s: Pitch 回到 0° → 同时 Roll/Pitch 做 8 字摆动
+      30–40s: 慢速绕 Z 轴旋转（偏航 360°）
+    """
+    phase = t % 40.0
+
+    if phase < 10:                          # 向右倾斜
+        roll_deg  = 45.0 * math.sin(math.pi * phase / 10)
+        pitch_deg = 0.0
+        yaw_rate  = 0.0
+    elif phase < 20:                        # 向前俯仰
+        roll_deg  = 0.0
+        pitch_deg = -30.0 * math.sin(math.pi * (phase - 10) / 10)
+        yaw_rate  = 0.0
+    elif phase < 30:                        # 8 字摆动
+        roll_deg  = 40.0 * math.sin(2 * math.pi * (phase - 20) / 5)
+        pitch_deg = 25.0 * math.sin(2 * math.pi * (phase - 20) / 7)
+        yaw_rate  = 5.0
+    else:                                   # 偏航旋转
+        roll_deg  = 5.0 * math.sin(phase * 0.8)   # 小幅晃动
+        pitch_deg = 3.0 * math.cos(phase * 1.1)
+        yaw_rate  = 90.0                           # 90 °/s 旋转
+
+    # 累积偏航（前三阶段偏航角为 0，第四阶段开始旋转）
+    yaw_offset = 0.0
+    if phase >= 30:
+        yaw_offset = yaw_rate * (phase - 30)
+
+    return roll_deg, pitch_deg, yaw_offset, yaw_rate
+
+
 def make_sensor_frame(timestamp_ms: int, t: float) -> bytes:
-    """生成仿真 MPU6050 传感器帧（TYPE=0x01, 18 字节 payload）"""
-    # 模拟 1g 重力（静止放置，Z 轴向上）
-    ax_raw = int(0.05 * math.sin(t * 2)   * 16384)          # 微小振动
-    ay_raw = int(0.05 * math.cos(t * 1.7) * 16384)
-    az_raw = int((1.0 + 0.02 * math.sin(t * 3)) * 16384)    # ~1g + 振动
+    """生成仿真 MPU6050 传感器帧（TYPE=0x01, 18 字节 payload）
 
-    # 模拟陀螺仪（缓慢旋转）
-    gx_raw = int(5.0  * math.sin(t * 0.5) * 65.5)
-    gy_raw = int(3.0  * math.cos(t * 0.7) * 65.5)
-    gz_raw = int(1.0  * t * 65.5) & 0x7FFF                  # 慢速偏航
+    加速度 = 重力向量经旋转矩阵投影到机体坐标系（物理一致）。
+    陀螺仪 = 姿态角速率 + 高频噪声。
+    """
+    roll_deg, pitch_deg, _, yaw_rate = sim_attitude(t)
 
-    # 温度（25℃ 附近漂移）
-    temp_raw = int((25.0 - 36.53) * 340.0 + 0.5 * math.sin(t * 0.1))
+    phi   = math.radians(roll_deg)
+    theta = math.radians(pitch_deg)
 
-    # 限幅到 int16 范围
+    # 旋转矩阵：重力向量 (0, 0, 1g) 在机体系的投影
+    # ax = -sin(θ),  ay = sin(φ)cos(θ),  az = cos(φ)cos(θ)
+    ax_g = -math.sin(theta)
+    ay_g =  math.sin(phi) * math.cos(theta)
+    az_g =  math.cos(phi) * math.cos(theta)
+
+    # 加上高频振动噪声（模拟 ADC 量化 + 机械振动）
+    noise = 0.008
+    ax_g += noise * math.sin(t * 47.3)
+    ay_g += noise * math.cos(t * 31.7)
+    az_g += noise * math.sin(t * 23.1)
+
+    # 陀螺仪 = 姿态角速率（数值差分近似）+ 噪声
+    dt = 0.01
+    r2, p2, _, _ = sim_attitude(t + dt)
+    gx_dps = (r2 - roll_deg)  / dt  + 0.3 * math.sin(t * 13.7)
+    gy_dps = (p2 - pitch_deg) / dt  + 0.2 * math.cos(t * 17.3)
+    gz_dps = yaw_rate          + 0.5 * math.sin(t * 9.1)
+
+    # MPU6050 原始值：加速度 LSB = 16384/g，陀螺仪 LSB = 65.5/(°/s)
+    ax_raw = int(ax_g * 16384)
+    ay_raw = int(ay_g * 16384)
+    az_raw = int(az_g * 16384)
+    gx_raw = int(gx_dps * 65.5)
+    gy_raw = int(gy_dps * 65.5)
+    gz_raw = int(gz_dps * 65.5)
+
+    # 温度（25℃ ± 1℃）
+    temp_raw = int((25.0 + 0.5 * math.sin(t * 0.05) - 36.53) * 340.0)
+
     def clamp16(v):
         return max(-32768, min(32767, v))
 
@@ -97,17 +159,20 @@ def make_sensor_frame(timestamp_ms: int, t: float) -> bytes:
 
 
 def make_ahrs_frame(timestamp_ms: int, t: float) -> bytes:
-    """生成仿真 AHRS 互补滤波帧（TYPE=0x02, 10 字节 payload）"""
-    roll  = int(15.0 * math.sin(t * 0.3) * 100)    # ±15°摇摆
-    pitch = int(10.0 * math.cos(t * 0.5) * 100)    # ±10°俯仰
-    yaw   = int((t * 20.0) % 360.0 * 100)          # 缓慢偏航，0~360°
+    """生成仿真 AHRS 帧（TYPE=0x02）—— 与 sensor_frame 姿态保持一致"""
+    roll_deg, pitch_deg, yaw_deg, _ = sim_attitude(t)
+
+    # 单位 0.01°，存为 int16
+    roll_x100  = int(roll_deg  * 100)
+    pitch_x100 = int(pitch_deg * 100)
+    yaw_x100   = int(yaw_deg   * 100) % 36000   # 0–360°
 
     def clamp16(v):
         return max(-32768, min(32767, v))
 
     payload = struct.pack('<Ihhh',
         timestamp_ms & 0xFFFFFFFF,
-        clamp16(roll), clamp16(pitch), clamp16(yaw)
+        clamp16(roll_x100), clamp16(pitch_x100), clamp16(yaw_x100)
     )
     return pack_frame(FRAME_TYPE_AHRS, payload)
 

@@ -193,6 +193,8 @@ class MainWindow(QtWidgets.QMainWindow):
         top = QtWidgets.QHBoxLayout()
         
         self.port_combo = QtWidgets.QComboBox()
+        self.port_combo.setEditable(True)          # 允许手动输入路径
+        self.port_combo.setMinimumWidth(260)
         self._refresh_ports()
         top.addWidget(QtWidgets.QLabel("串口:"))
         top.addWidget(self.port_combo)
@@ -286,9 +288,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_timer.start(50)  # 20fps
     
     def _refresh_ports(self):
+        import glob, os
+        current = self.port_combo.currentText()
         self.port_combo.clear()
+        # 真实硬件串口
         for p in list_ports.comports():
             self.port_combo.addItem(p.device)
+        # socat 创建的虚拟串口符号链接（/tmp/tty_*）
+        for path in sorted(glob.glob('/tmp/tty_*')):
+            if os.path.exists(path):
+                self.port_combo.addItem(path)
+        # 恢复之前选中的值
+        idx = self.port_combo.findText(current)
+        if idx >= 0:
+            self.port_combo.setCurrentIndex(idx)
+        elif current:
+            self.port_combo.setCurrentText(current)
     
     def _on_connect(self):
         if self.reader and self.reader.isRunning():

@@ -41,7 +41,8 @@ import serial
 import sys
 
 # ===== 配置 =====
-SIM_PORT  = '/dev/pts/3'   # 改为 socat 输出的第一个端口
+# 默认端口可被 --port 命令行参数覆盖，无需手动编辑本文件
+SIM_PORT  = '/dev/pts/3'   # 默认值（用 --port /tmp/tty_stm32 覆盖）
 BAUDRATE  = 115200
 RATE_HZ   = 100            # 发送频率
 
@@ -136,21 +137,34 @@ def make_diag_frame(timestamp_ms: int, t: float) -> bytes:
 
 
 def main():
-    print(f"[模拟器] 打开串口 {SIM_PORT} @ {BAUDRATE}")
+    import argparse
+    parser = argparse.ArgumentParser(description='STM32 传感器数据模拟器')
+    parser.add_argument('--port', default=SIM_PORT,
+                        help='虚拟串口路径（默认: %(default)s）')
+    parser.add_argument('--rate', type=int, default=RATE_HZ,
+                        help='发送频率 Hz（默认: %(default)s）')
+    args = parser.parse_args()
+
+    port = args.port
+    rate = args.rate
+
+    print(f"[模拟器] 打开串口 {port} @ {BAUDRATE}")
     try:
-        ser = serial.Serial(SIM_PORT, BAUDRATE, timeout=1)
+        ser = serial.Serial(port, BAUDRATE, timeout=1)
     except Exception as e:
         print(f"[错误] 无法打开串口: {e}")
-        print("请先用 socat 创建虚拟串口对，然后修改脚本顶部的 SIM_PORT")
+        print("请先用 socat 创建虚拟串口对：")
+        print("  socat -d -d pty,raw,echo=0,link=/tmp/tty_stm32 pty,raw,echo=0,link=/tmp/tty_pc")
+        print(f"然后运行: python simulator.py --port /tmp/tty_stm32")
         sys.exit(1)
 
-    interval      = 1.0 / RATE_HZ
+    interval      = 1.0 / rate
     start         = time.time()
     count         = 0
     last_diag_t   = -999.0   # 上次发送诊断帧的时间
 
-    print(f"[模拟器] 开始发送数据，频率 {RATE_HZ} Hz，按 Ctrl+C 停止")
-    print(f"[模拟器] 请在上位机中选择另一个虚拟串口并点击"连接"")
+    print(f"[模拟器] 开始发送数据，频率 {rate} Hz，按 Ctrl+C 停止")
+    print(f"[模拟器] 请在上位机中选择另一个虚拟串口并点击\"连接\"")
 
     try:
         while True:
@@ -166,7 +180,7 @@ def main():
                 last_diag_t = t
 
             count += 1
-            if count % (RATE_HZ * 5) == 0:
+            if count % (rate * 5) == 0:
                 print(f"[模拟器] 已发送 {count} 帧，运行时间 {t:.1f}s")
 
             next_tick  = start + count * interval

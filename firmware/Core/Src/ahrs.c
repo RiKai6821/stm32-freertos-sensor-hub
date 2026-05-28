@@ -39,9 +39,28 @@ void AHRS_Update(AhrsAngle_t *ahrs,
     float acc_roll  = atan2f(fay, faz) * DEG_PER_RAD;
     float acc_pitch = atan2f(-fax, sqrtf(fay * fay + faz * faz)) * DEG_PER_RAD;
 
+    /*
+     * 自适应 alpha: 当设备做线性加速度时, 加速度计测量值不再代表纯重力方向,
+     * 此时加速度计的"修正"反而会引入误差。
+     *
+     * 做法: 计算加速度模长与 1g 的偏差。偏差越大, 越信任陀螺仪 (alpha 越大)。
+     *   deviation < TRUST_THR : alpha = AHRS_ALPHA (标准融合)
+     *   deviation >= ZERO_THR : alpha = 0.9999     (纯陀螺积分)
+     *   中间段线性插值
+     *
+     * 这种做法在工程上被称为 "acceleration compensation" 或 "dynamic trust",
+     * 是 Mahony/Madgwick 之外互补滤波工程化的常见手段。
+     */
+    float accel_mag  = sqrtf(fax*fax + fay*fay + faz*faz);
+    float deviation  = fabsf(accel_mag - 1.0f);
+    float t = (deviation - AHRS_ACCEL_TRUST_THR) / (AHRS_ACCEL_ZERO_THR - AHRS_ACCEL_TRUST_THR);
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    float alpha_dyn = AHRS_ALPHA + (0.9999f - AHRS_ALPHA) * t;
+
     /* 互补融合：高频信任陀螺仪，低频信任加速度计 */
-    ahrs->roll  = AHRS_ALPHA * pred_roll  + (1.0f - AHRS_ALPHA) * acc_roll;
-    ahrs->pitch = AHRS_ALPHA * pred_pitch + (1.0f - AHRS_ALPHA) * acc_pitch;
+    ahrs->roll  = alpha_dyn * pred_roll  + (1.0f - alpha_dyn) * acc_roll;
+    ahrs->pitch = alpha_dyn * pred_pitch + (1.0f - alpha_dyn) * acc_pitch;
     ahrs->yaw   = pred_yaw;  /* 无磁力计：纯积分，有漂移 */
 
     /* 将 yaw 归一化到 [−180, 180) */

@@ -21,9 +21,21 @@
 #include <stdint.h>
 
 /* MPU6050 量程参数（与 mpu6050.c 配置保持一致） */
-#define AHRS_GYRO_SCALE   (1.0f / 65.5f)    /* LSB → deg/s，FS_SEL=1 ±500deg/s */
-#define AHRS_ACCEL_SCALE  (1.0f / 16384.0f) /* LSB → g，AFS_SEL=0 ±2g */
-#define AHRS_ALPHA        0.98f              /* 互补滤波系数（陀螺仪权重） */
+#define AHRS_GYRO_SCALE   (1.0f / 65.5f)    /* LSB → deg/s, FS_SEL=1 ±500deg/s */
+#define AHRS_ACCEL_SCALE  (1.0f / 16384.0f) /* LSB → g, AFS_SEL=0 ±2g */
+#define AHRS_ALPHA        0.98f              /* 静止时的滤波系数（陀螺仪权重） */
+
+/*
+ * 自适应 alpha 阈值（g）:
+ *   当 |a| 偏离 1g 小于此值时，认为设备处于"近静止"状态，
+ *   使用标准 AHRS_ALPHA。偏离越大，越信任陀螺仪（alpha → 0.9999），
+ *   防止加速度计的线性加速度分量污染姿态角。
+ *
+ *   实测: 手持轻摇时 |a| 偏离约 0.15~0.4g
+ *         剧烈运动时可达 0.5g+
+ */
+#define AHRS_ACCEL_TRUST_THR  0.1f  /* |a|-1g 低于此值时满信任加速度计 */
+#define AHRS_ACCEL_ZERO_THR   0.3f  /* |a|-1g 高于此值时完全不信任加速度计 */
 
 typedef struct {
     float roll;   /* 滚转角 deg，X 轴旋转 */

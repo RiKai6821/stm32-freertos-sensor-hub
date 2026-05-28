@@ -30,7 +30,13 @@ FRAME_HEADER_1 = 0xAA
 FRAME_HEADER_2 = 0x55
 FRAME_TYPE_SENSOR_DATA  = 0x01
 FRAME_TYPE_AHRS_DATA    = 0x02
+FRAME_TYPE_DIAG         = 0x03   # 系统诊断帧 (每 5 秒)
 FRAME_TYPE_CMD_SET_RATE = 0x10
+
+# DiagPayload 解包: uint32 timestamp + 7×uint16
+# (stack_sensor, stack_comm, stack_disp, stack_cmd 均为 words)
+# + i2c_err + uart_err + rate_hz
+DIAG_STRUCT = struct.Struct('<I7H')  # 4 + 14 = 18 bytes
 
 # 缓冲长度（500 个点 ≈ 5 秒 @ 100Hz）
 MAX_POINTS = 500
@@ -119,14 +125,29 @@ class SerialReader(QThread):
                 'temp':  temp / 340.0 + 36.53,
             })
         elif frame_type == FRAME_TYPE_AHRS_DATA and len(payload) == 10:
-            # <I hhh : timestamp(4B) + roll(2B) + pitch(2B) + yaw(2B)
             ts, roll, pitch, yaw = struct.unpack('<Ihhh', payload)
             self.frame_received.emit({
                 'type': 'ahrs',
                 'timestamp': ts,
-                'roll':  roll  / 100.0,   # deg
+                'roll':  roll  / 100.0,
                 'pitch': pitch / 100.0,
                 'yaw':   yaw   / 100.0,
+            })
+        elif frame_type == FRAME_TYPE_DIAG and len(payload) == DIAG_STRUCT.size:
+            ts, s_sensor, s_comm, s_disp, s_cmd, i2c_err, uart_err, rate = \
+                DIAG_STRUCT.unpack(payload)
+            self.frame_received.emit({
+                'type': 'diag',
+                'timestamp':    ts,
+                'stacks': {          # words remaining (1 word = 4 bytes)
+                    'Sensor':  s_sensor,
+                    'Comm':    s_comm,
+                    'Display': s_disp,
+                    'Cmd':     s_cmd,
+                },
+                'i2c_err':   i2c_err,
+                'uart_err':  uart_err,
+                'rate_hz':   rate,
             })
     
     def send_set_rate(self, rate_hz: int):
@@ -231,12 +252,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.roll_curve  = ahrs_plot.plot(pen=pg.mkPen('r', width=2), name='Roll')
         self.pitch_curve = ahrs_plot.plot(pen=pg.mkPen('b', width=2), name='Pitch')
 
-        # 底部：状态栏
-        self.status_label = QtWidgets.QLabel("未连接")
-        self.value_label  = QtWidgets.QLabel("---")
+        # 底部：数值 + 诊断面板 + 状态栏
+        self.value_label = QtWidgets.QLabel("---")
         self.value_label.setStyleSheet("font-family: monospace; font-size: 12px;")
-        self.ahrs_label   = QtWidgets.QLabel("AHRS: ---")
+        self.ahrs_label  = QtWidgets.QLabel("AHRS: ---")
         self.ahrs_label.setStyleSheet("font-family: monospace; font-size: 12px; color: #c00;")
+
+        # 诊断面板: FreeRTOS 栈水位 + 错误计数
+        self.diag_label = QtWidgets.QLabel("诊断: 等待设备数据...")
+        self.diag_label.setStyleSheet(
+            "font-family: monospace; font-size: 11px; "
+            "background: #f0f4ff; border: 1px solid #aac; padding: 3px;"
+        )
+
+        self.status_label = QtWidgets.QLabel("未连接")
 
         # 整体布局
         central = QtWidgets.QWidget()
@@ -247,6 +276,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(ahrs_plot, stretch=2)
         layout.addWidget(self.value_label)
         layout.addWidget(self.ahrs_label)
+        layout.addWidget(self.diag_label)
         layout.addWidget(self.status_label)
         self.setCentralWidget(central)
         
@@ -281,7 +311,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText(f"已连接到 {port}")
     
     def _on_frame(self, d: dict):
-        if d.get('type') == 'ahrs':
+        kind = d.get('type')
+
+        if kind == 'ahrs':
             self.t_ahrs_buf.append(d['timestamp'] / 1000.0)
             self.roll_buf.append(d['roll'])
             self.pitch_buf.append(d['pitch'])
@@ -289,6 +321,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"AHRS  Roll={d['roll']:+7.2f}°  "
                 f"Pitch={d['pitch']:+7.2f}°  "
                 f"Yaw={d['yaw']:+7.2f}° (drift)"
+            )
+            return
+
+        if kind == 'diag':
+            # 显示 FreeRTOS 任务栈水位和错误统计
+            stacks  = d['stacks']
+            # 判断哪些任务栈剩余偏低 (< 32 words = 128 bytes → 警告)
+            def fmt_wm(name, words):
+                warn = " ⚠" if words < 32 else ""
+                return f"{name}:{words}w{warn}"
+            wm_str  = "  ".join(fmt_wm(n, v) for n, v in stacks.items())
+            err_str = f"I2C_err={d['i2c_err']}  UART_err={d['uart_err']}"
+            rate_str = f"采样率={d['rate_hz']}Hz"
+            self.diag_label.setText(
+                f"[FreeRTOS 诊断 @{d['timestamp']//1000}s]  "
+                f"栈水位(words): {wm_str}    "
+                f"{err_str}    {rate_str}"
+            )
+            # 根据有无告警更新背景色
+            any_warn = any(v < 32 for v in stacks.values()) or \
+                       d['i2c_err'] > 0 or d['uart_err'] > 0
+            color = "#fff0f0" if any_warn else "#f0f4ff"
+            self.diag_label.setStyleSheet(
+                f"font-family: monospace; font-size: 11px; "
+                f"background: {color}; border: 1px solid #aac; padding: 3px;"
             )
             return
 

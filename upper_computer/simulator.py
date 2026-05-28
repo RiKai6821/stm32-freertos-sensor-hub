@@ -50,6 +50,7 @@ FRAME_HEADER_1       = 0xAA
 FRAME_HEADER_2       = 0x55
 FRAME_TYPE_SENSOR    = 0x01
 FRAME_TYPE_AHRS      = 0x02
+FRAME_TYPE_DIAG      = 0x03
 
 
 def calc_xor(data: bytes) -> int:
@@ -110,6 +111,30 @@ def make_ahrs_frame(timestamp_ms: int, t: float) -> bytes:
     return pack_frame(FRAME_TYPE_AHRS, payload)
 
 
+def make_diag_frame(timestamp_ms: int, t: float) -> bytes:
+    """生成仿真诊断帧（TYPE=0x03, 18 字节 payload）
+
+    模拟 FreeRTOS 任务栈水位随时间缓慢减少（正常运行时应保持稳定），
+    以及偶发的 I2C 错误（约每 30 秒一次，模拟真实传感器偶尔 NAK）。
+    """
+    # 栈水位：从初始值缓慢减少后稳定（模拟任务启动后的正常消耗）
+    decay    = max(0, 50 - int(t / 5))   # 前 250 秒缓慢减少
+    stacks   = (128 + decay, 110 + decay, 90 + decay, 100 + decay)  # words
+
+    i2c_err  = int(t / 30)   # 约每 30 秒累加一次
+    uart_err = 0
+    rate_hz  = 100
+
+    payload = struct.pack('<I7H',
+        timestamp_ms & 0xFFFFFFFF,
+        *stacks,
+        i2c_err & 0xFFFF,
+        uart_err,
+        rate_hz,
+    )
+    return pack_frame(FRAME_TYPE_DIAG, payload)
+
+
 def main():
     print(f"[模拟器] 打开串口 {SIM_PORT} @ {BAUDRATE}")
     try:
@@ -119,30 +144,32 @@ def main():
         print("请先用 socat 创建虚拟串口对，然后修改脚本顶部的 SIM_PORT")
         sys.exit(1)
 
-    interval = 1.0 / RATE_HZ
-    start    = time.time()
-    count    = 0
+    interval      = 1.0 / RATE_HZ
+    start         = time.time()
+    count         = 0
+    last_diag_t   = -999.0   # 上次发送诊断帧的时间
 
     print(f"[模拟器] 开始发送数据，频率 {RATE_HZ} Hz，按 Ctrl+C 停止")
     print(f"[模拟器] 请在上位机中选择另一个虚拟串口并点击"连接"")
 
     try:
         while True:
-            t          = time.time() - start
-            ts_ms      = int(t * 1000)
+            t     = time.time() - start
+            ts_ms = int(t * 1000)
 
-            sensor_frame = make_sensor_frame(ts_ms, t)
-            ahrs_frame   = make_ahrs_frame(ts_ms, t)
+            ser.write(make_sensor_frame(ts_ms, t))
+            ser.write(make_ahrs_frame(ts_ms, t))
 
-            ser.write(sensor_frame)
-            ser.write(ahrs_frame)
+            # 每 5 秒发送一次诊断帧（与固件行为一致）
+            if t - last_diag_t >= 5.0:
+                ser.write(make_diag_frame(ts_ms, t))
+                last_diag_t = t
 
             count += 1
             if count % (RATE_HZ * 5) == 0:
                 print(f"[模拟器] 已发送 {count} 帧，运行时间 {t:.1f}s")
 
-            # 精确定时
-            next_tick = start + count * interval
+            next_tick  = start + count * interval
             sleep_time = next_tick - time.time()
             if sleep_time > 0:
                 time.sleep(sleep_time)

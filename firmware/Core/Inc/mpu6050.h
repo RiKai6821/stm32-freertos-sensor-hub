@@ -35,6 +35,20 @@ typedef struct {
 } MPU6050_Data_t;
 
 /**
+ * 陀螺仪零漂标定结果
+ *
+ * MPU6050 陀螺仪在出厂时存在典型 ±20 LSB 的零漂（约 ±0.3 deg/s），
+ * 温变后可漂移更多。静止采集 N 次并平均，即可估计这个偏差。
+ * 每次上电后执行一次标定（设备应保持静止约 2 秒）。
+ */
+typedef struct {
+    int16_t gx_bias;   /* 陀螺 X 轴零漂 (LSB) */
+    int16_t gy_bias;   /* 陀螺 Y 轴零漂 (LSB) */
+    int16_t gz_bias;   /* 陀螺 Z 轴零漂 (LSB) */
+    uint8_t valid;     /* 1 = 标定有效 */
+} MPU6050_Calib_t;
+
+/**
  * @brief  初始化 MPU6050
  * @return HAL_OK / HAL_ERROR
  */
@@ -49,5 +63,23 @@ HAL_StatusTypeDef MPU6050_ReadAll(I2C_HandleTypeDef *hi2c, MPU6050_Data_t *data)
  * @brief  WHO_AM_I 自检，返回 0x68 表示芯片正常
  */
 uint8_t MPU6050_WhoAmI(I2C_HandleTypeDef *hi2c);
+
+/**
+ * @brief  陀螺仪零漂标定
+ * @param  hi2c       I2C 句柄
+ * @param  cal        输出的标定结果
+ * @param  n_samples  采样次数（推荐 200，约 2 秒）
+ * @note   调用时设备必须静止放置。采集完成后 cal->valid = 1。
+ * @return HAL_OK / HAL_ERROR
+ */
+HAL_StatusTypeDef MPU6050_Calibrate(I2C_HandleTypeDef *hi2c,
+                                    MPU6050_Calib_t   *cal,
+                                    uint16_t           n_samples);
+
+/**
+ * @brief  将标定结果应用到一帧传感器数据（减去零漂偏置）
+ * @note   若 cal->valid == 0 则不做任何操作。
+ */
+void MPU6050_ApplyCalib(MPU6050_Data_t *data, const MPU6050_Calib_t *cal);
 
 #endif

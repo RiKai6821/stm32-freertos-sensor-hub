@@ -35,10 +35,17 @@ osMessageQueueId_t displayQueueHandle;  /* MPU6050 数据 → 显示任务 */
 osMessageQueueId_t cmdQueueHandle;      /* UART 收到的命令字节 */
 
 osMutexId_t configMutexHandle;
-osMutexId_t uartTxMutexHandle;          /* 保护 UART TX（CommTask + CmdTask 共用） */
+osMutexId_t uartTxMutexHandle;          /* 保护 UART TX (CommTask + CmdTask 共用) */
 
 /* ===== 全局配置（互斥量保护） ===== */
 static uint16_t g_sample_rate_hz = 100;  /* 默认 100Hz */
+
+/* ===== 陀螺仪标定结果 ===== */
+static MPU6050_Calib_t g_mpu_calib = { 0 };
+
+/* ===== 错误计数器 ===== */
+volatile uint16_t g_i2c_err_count  = 0;
+volatile uint16_t g_uart_err_count = 0;
 
 /* ===== UART 接收 ===== */
 static uint8_t uart_rx_byte;
@@ -70,6 +77,15 @@ int main(void)
             HAL_Delay(100);
         }
     }
+
+    /*
+     * 陀螺仪零漂标定 (设备上电后静止放置 2 秒)
+     * 采集 200 次 @10ms, 求均值作为零漂偏置。
+     * 上电后 LED 亮起提示"标定中"，标定完成后熄灭。
+     */
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);  /* LED 亮 = 标定中 */
+    MPU6050_Calibrate(&hi2c1, &g_mpu_calib, 200);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);    /* LED 灭 = 标定完成 */
     
     /* 启动 UART 接收 */
     HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
@@ -115,10 +131,14 @@ static void SensorTask(void *argument)
     while (1) {
         /* 读取传感器 */
         if (MPU6050_ReadAll(&hi2c1, &data) == HAL_OK) {
+            /* 应用陀螺仪零漂标定，减去上电时估计的偏置 */
+            MPU6050_ApplyCalib(&data, &g_mpu_calib);
             /* 投递到通信队列（如果满了不阻塞，丢弃旧数据策略由队列实现） */
             osMessageQueuePut(sensorQueueHandle, &data, 0, 0);
             /* 投递到显示队列（容量小，主要给最新数据） */
             osMessageQueuePut(displayQueueHandle, &data, 0, 0);
+        } else {
+            g_i2c_err_count++;
         }
         
         /* 按配置的采样率周期性运行 */
@@ -140,10 +160,20 @@ static void CommTask(void *argument)
     MPU6050_Data_t  data;
     SensorPayload_t payload;
     AhrsPayload_t   ahrs_payload;
+    DiagPayload_t   diag_payload;
     AhrsAngle_t     ahrs;
     uint8_t  frame_buf[64];
-    uint32_t last_tick = 0;
+    uint32_t last_tick      = 0;
+    uint32_t last_diag_tick = 0;
     uint8_t  ahrs_initialized = 0;
+
+    /* 本地宏: 发送帧并统计 TX 错误 */
+    #define UART_SEND(buf, len) do {                                      \
+        osMutexAcquire(uartTxMutexHandle, osWaitForever);                 \
+        if (HAL_UART_Transmit(&huart1, (buf), (len), 50) != HAL_OK)      \
+            g_uart_err_count++;                                           \
+        osMutexRelease(uartTxMutexHandle);                                \
+    } while (0)
 
     while (1) {
         /* 阻塞等待传感器数据 */
@@ -153,13 +183,12 @@ static void CommTask(void *argument)
 
         uint32_t now = osKernelGetTickCount();
 
-        /* ---- AHRS 互补滤波更新 ---- */
+        /* ---- AHRS 互补滤波更新（带自适应 alpha）---- */
         if (!ahrs_initialized) {
             AHRS_Init(&ahrs, data.accel_x, data.accel_y, data.accel_z);
             ahrs_initialized = 1;
         } else {
             uint32_t dt_ms = now - last_tick;
-            /* dt 超出合理范围时跳过（初始帧或调试暂停） */
             if (dt_ms > 0 && dt_ms < 500) {
                 AHRS_Update(&ahrs,
                             data.accel_x, data.accel_y, data.accel_z,
@@ -181,11 +210,9 @@ static void CommTask(void *argument)
 
         uint16_t len = Protocol_Pack(frame_buf, FRAME_TYPE_SENSOR_DATA,
                                      &payload, sizeof(payload));
-        osMutexAcquire(uartTxMutexHandle, osWaitForever);
-        HAL_UART_Transmit(&huart1, frame_buf, len, 50);
-        osMutexRelease(uartTxMutexHandle);
+        UART_SEND(frame_buf, len);
 
-        /* ---- 帧 2：AHRS 姿态角（互补滤波输出，0.01° 精度） ---- */
+        /* ---- 帧 2：AHRS 姿态角（0.01° 精度）---- */
         ahrs_payload.timestamp = now;
         ahrs_payload.roll      = (int16_t)(ahrs.roll  * 100.0f);
         ahrs_payload.pitch     = (int16_t)(ahrs.pitch * 100.0f);
@@ -193,10 +220,39 @@ static void CommTask(void *argument)
 
         len = Protocol_Pack(frame_buf, FRAME_TYPE_AHRS_DATA,
                             &ahrs_payload, sizeof(ahrs_payload));
-        osMutexAcquire(uartTxMutexHandle, osWaitForever);
-        HAL_UART_Transmit(&huart1, frame_buf, len, 50);
-        osMutexRelease(uartTxMutexHandle);
+        UART_SEND(frame_buf, len);
+
+        /* ---- 帧 3：系统诊断（每 5 秒一次）----
+         *
+         * 上报 FreeRTOS 任务栈水位（stack high water mark）和错误统计。
+         * 栈水位 = 任务栈中从未被使用的最大空间，单位：words（4 字节）。
+         * 当水位接近 0 时说明栈即将溢出，需要在 osThreadAttr_t 中增加 stack_size。
+         *
+         * 工程意义：生产固件中通常把这类数据通过调试口或日志接口周期性输出，
+         * 是"运行时安全网"的一部分，防止栈溢出导致静默故障。
+         */
+        if (now - last_diag_tick >= 5000u) {
+            last_diag_tick = now;
+
+            osMutexAcquire(configMutexHandle, osWaitForever);
+            uint16_t rate = g_sample_rate_hz;
+            osMutexRelease(configMutexHandle);
+
+            diag_payload.timestamp       = now;
+            diag_payload.stack_sensor_wm = (uint16_t)uxTaskGetStackHighWaterMark(sensorTaskHandle);
+            diag_payload.stack_comm_wm   = (uint16_t)uxTaskGetStackHighWaterMark(NULL); /* 当前任务 */
+            diag_payload.stack_disp_wm   = (uint16_t)uxTaskGetStackHighWaterMark(displayTaskHandle);
+            diag_payload.stack_cmd_wm    = (uint16_t)uxTaskGetStackHighWaterMark(cmdTaskHandle);
+            diag_payload.i2c_err_count   = g_i2c_err_count;
+            diag_payload.uart_err_count  = g_uart_err_count;
+            diag_payload.sample_rate_hz  = rate;
+
+            len = Protocol_Pack(frame_buf, FRAME_TYPE_DIAG,
+                                &diag_payload, sizeof(diag_payload));
+            UART_SEND(frame_buf, len);
+        }
     }
+    #undef UART_SEND
 }
 
 /* =========================================================

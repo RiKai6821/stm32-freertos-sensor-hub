@@ -1,18 +1,38 @@
 /**
  * @file    ahrs.h
- * @brief   互补滤波姿态解算（AHRS - Attitude and Heading Reference System）
- * @details 融合加速度计（低频，无漂移）和陀螺仪（高频，有漂移），
- *          输出 roll / pitch / yaw 三轴姿态角。
+ * @brief   Mahony AHRS 姿态解算（替换互补滤波）
  *
- *   算法原理：
- *     angle = α × (angle + ω × dt) + (1−α) × accel_angle
- *     α = 0.98：高频依赖陀螺仪积分，低频依赖加速度计修正
+ * 算法：Mahony et al. "Nonlinear Complementary Filters on the Special
+ *        Orthogonal Group", IEEE TAC 2008.
  *
- *   局限：
- *     - yaw 无加速度计修正，仅陀螺积分，存在漂移（需磁力计才能消除）
- *     - 剧烈加速时加速度计分量失真，α 可适当调大
+ * 核心思想：
+ *   用四元数表示姿态（避免万向节死锁），以加速度计测量值与由当前四元数
+ *   估算的重力方向之间的叉积误差，通过 PI 控制器校正陀螺仪积分：
  *
- *   编译依赖：需要链接 libm（CubeIDE: Linker flags 加 -lm）
+ *     误差 e = a_meas × v_est          （叉积：方向偏差）
+ *     积分   ω_bias += Ki × e × dt      （消除陀螺常值漂移）
+ *     修正   ω_corr = ω_raw + Kp×e + ω_bias
+ *     更新   q += 0.5 × q ⊗ [0, ω_corr] × dt
+ *     归一化 q = q / |q|
+ *
+ * 与互补滤波的关键区别：
+ *   | 特性         | 互补滤波           | Mahony AHRS          |
+ *   |------------|------------------|----------------------|
+ *   | 旋转表示    | 欧拉角（有奇点）   | 四元数（无奇点）     |
+ *   | 陀螺漂移    | 无积分修正         | Ki 积分项消除常值偏置|
+ *   | 动态响应    | 线性融合           | 非线性 PI 反馈       |
+ *   | 计算开销    | 2× arctan         | 叉积 + invSqrt      |
+ *   | 工业应用    | 教学演示           | ArduPilot/PX4/BetaFlight 内核 |
+ *
+ * API 兼容性：
+ *   结构体 AhrsAngle_t 内嵌四元数状态，函数签名与原互补滤波版本完全相同，
+ *   main.c 无需任何修改。
+ *
+ * 参数调优指南：
+ *   Kp 增大 → 加速度计响应更快，但噪声抑制减弱（Kp=2.0 通常为起点）
+ *   Ki 增大 → 陀螺漂移收敛更快，但可能引入低频振荡（Ki=0.005 通常安全）
+ *   静止场景：Kp=2.0, Ki=0.005
+ *   高动态场景（无人机）：Kp=10.0, Ki=0.0（禁用积分避免机动时饱和）
  */
 
 #ifndef __AHRS_H
@@ -20,42 +40,53 @@
 
 #include <stdint.h>
 
-/* MPU6050 量程参数（与 mpu6050.c 配置保持一致） */
-#define AHRS_GYRO_SCALE   (1.0f / 65.5f)    /* LSB → deg/s, FS_SEL=1 ±500deg/s */
-#define AHRS_ACCEL_SCALE  (1.0f / 16384.0f) /* LSB → g, AFS_SEL=0 ±2g */
-#define AHRS_ALPHA        0.98f              /* 静止时的滤波系数（陀螺仪权重） */
+/* ===== 传感器量程（与 mpu6050.c 配置保持一致）===== */
+#define AHRS_GYRO_SCALE   (1.0f / 65.5f)     /* LSB → deg/s, FS_SEL=1 (±500°/s) */
+#define AHRS_ACCEL_SCALE  (1.0f / 16384.0f)  /* LSB → g,    AFS_SEL=0 (±2g)    */
+#define DEG_TO_RAD        (3.14159265358979f / 180.0f)
+#define RAD_TO_DEG        (180.0f / 3.14159265358979f)
 
-/*
- * 自适应 alpha 阈值（g）:
- *   当 |a| 偏离 1g 小于此值时，认为设备处于"近静止"状态，
- *   使用标准 AHRS_ALPHA。偏离越大，越信任陀螺仪（alpha → 0.9999），
- *   防止加速度计的线性加速度分量污染姿态角。
+/* ===== Mahony PI 参数 ===== */
+#define MAHONY_KP         2.0f    /**< 比例增益：加速度计修正权重，增大加快收敛  */
+#define MAHONY_KI         0.005f  /**< 积分增益：消除陀螺常值偏置（零漂残差）   */
+
+/**
+ * @brief 姿态状态结构体（含 Mahony 四元数内部状态）
  *
- *   实测: 手持轻摇时 |a| 偏离约 0.15~0.4g
- *         剧烈运动时可达 0.5g+
+ * 外部只需读取 roll / pitch / yaw，四元数和积分项由算法内部维护。
+ * 结构体大小约 40 字节，可安全放在 FreeRTOS 任务栈上。
  */
-#define AHRS_ACCEL_TRUST_THR  0.1f  /* |a|-1g 低于此值时满信任加速度计 */
-#define AHRS_ACCEL_ZERO_THR   0.3f  /* |a|-1g 高于此值时完全不信任加速度计 */
-
 typedef struct {
-    float roll;   /* 滚转角 deg，X 轴旋转 */
-    float pitch;  /* 俯仰角 deg，Y 轴旋转 */
-    float yaw;    /* 偏航角 deg，Z 轴旋转（仅陀螺积分） */
+    /* ── 输出：欧拉角（单位：度）── */
+    float roll;    /**< 滚转角，X 轴旋转，[-180, 180]  */
+    float pitch;   /**< 俯仰角，Y 轴旋转，[-90,  90]   */
+    float yaw;     /**< 偏航角，Z 轴旋转，[-180, 180]（无磁力计时仅陀螺积分）*/
+
+    /* ── 内部：Mahony 四元数状态 ── */
+    float q0, q1, q2, q3;   /**< 单位四元数 (w, x, y, z)，初始化为 (1,0,0,0) */
+    float ix, iy, iz;        /**< 陀螺积分误差（PI 积分项）                    */
 } AhrsAngle_t;
 
 /**
- * @brief  用加速度计数据初始化姿态（消除上电时的初始偏差）
- * @param  ahrs        姿态状态指针
- * @param  ax/ay/az    MPU6050 加速度 LSB 原始值
+ * @brief  用加速度计测量值初始化姿态。
+ *         根据重力方向估计初始 roll / pitch，将四元数设为对应值，
+ *         消除上电静置时的初始偏差。
+ *
+ * @param  ahrs    姿态状态指针（须已分配，无需清零）
+ * @param  ax/ay/az  MPU6050 加速度原始 LSB
  */
 void AHRS_Init(AhrsAngle_t *ahrs, int16_t ax, int16_t ay, int16_t az);
 
 /**
- * @brief  互补滤波更新（每个采样周期调用一次）
- * @param  ahrs         姿态状态指针
- * @param  ax/ay/az     加速度 LSB
- * @param  gx/gy/gz     角速度 LSB（GYRO_CONFIG=0x08, ±500deg/s）
- * @param  dt_ms        本次更新的时间步长（ms）
+ * @brief  Mahony AHRS 单步更新（每个采样周期调用一次）。
+ *
+ * @param  ahrs          姿态状态指针
+ * @param  ax/ay/az      加速度 LSB（FS_SEL=0, ±2g）
+ * @param  gx/gy/gz      角速度 LSB（FS_SEL=1, ±500°/s）
+ * @param  dt_ms         本次更新时间步长（ms）
+ *
+ * @note   dt_ms 应为真实采样间隔，不要传固定值，否则积分误差会积累。
+ *         SensorTask 中通过 osDelayUntil 保证等时采样，dt_ms 近似恒定。
  */
 void AHRS_Update(AhrsAngle_t *ahrs,
                  int16_t ax, int16_t ay, int16_t az,
